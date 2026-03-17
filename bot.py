@@ -1,6 +1,13 @@
 import asyncio
+import logging
 import re
-from aiogram import Bot, Dispatcher, F
+import time
+from collections import defaultdict, deque
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
@@ -12,10 +19,94 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
-from config import BOT_TOKEN
+from config import (
+    ANALYSIS_COOLDOWN_SECONDS,
+    ANALYSIS_QUEUE_TIMEOUT_SECONDS,
+    ANALYSIS_TIMEOUT_SECONDS,
+    BOT_TOKEN,
+    LOG_LEVEL,
+    MAX_ANALYSIS_TEXT_CHARS,
+    MAX_DIALOG_MESSAGES,
+    MAX_CONCURRENT_ANALYSES,
+    MESSAGE_RATE_LIMIT_COUNT,
+    MESSAGE_RATE_LIMIT_NOTICE_COOLDOWN,
+    MESSAGE_RATE_LIMIT_WINDOW_SECONDS,
+)
 from ai_analyzer import analyze_chat
 
-dp = Dispatcher()
+
+def configure_logging() -> None:
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+logger = logging.getLogger(__name__)
+
+
+class AntiSpamMiddleware(BaseMiddleware):
+    def __init__(
+        self,
+        limit_count: int,
+        window_seconds: int,
+        notice_cooldown: int,
+    ) -> None:
+        self.limit_count = limit_count
+        self.window_seconds = window_seconds
+        self.notice_cooldown = notice_cooldown
+        self.user_events: dict[int, deque[float]] = defaultdict(deque)
+        self.notice_sent_at: dict[int, float] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: dict[str, Any],
+    ) -> Any:
+        if event.chat.type != "private":
+            return None
+
+        user = event.from_user
+        if user is None:
+            return await handler(event, data)
+
+        now = time.monotonic()
+        timestamps = self.user_events[user.id]
+        cutoff = now - self.window_seconds
+
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+
+        if len(timestamps) >= self.limit_count:
+            last_notice = self.notice_sent_at.get(user.id, 0.0)
+            if now - last_notice >= self.notice_cooldown:
+                self.notice_sent_at[user.id] = now
+                await event.answer(
+                    "Слишком много сообщений за короткое время. Подожди несколько секунд и продолжай."
+                )
+            logger.warning("Rate limit triggered for user_id=%s", user.id)
+            return None
+
+        timestamps.append(now)
+        return await handler(event, data)
+
+
+analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
+analysis_cooldowns: dict[int, float] = {}
+
+dp = Dispatcher(
+    storage=MemoryStorage(),
+    events_isolation=SimpleEventIsolation()
+)
+dp.message.middleware(
+    AntiSpamMiddleware(
+        limit_count=MESSAGE_RATE_LIMIT_COUNT,
+        window_seconds=MESSAGE_RATE_LIMIT_WINDOW_SECONDS,
+        notice_cooldown=MESSAGE_RATE_LIMIT_NOTICE_COOLDOWN,
+    )
+)
 
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -234,38 +325,40 @@ async def collect_preview_handler(message: Message, state: FSMContext):
         )
         return
 
-    if not preview_waiting_sent:
+    if len(preview_messages) >= 2 and len(participants) == 1 and not preview_waiting_sent:
         await state.update_data(preview_waiting_sent=True)
         await message.answer(
-            f"Пока вижу участников: {', '.join(participants)}\n"
-            "Перешли ещё сообщение второго участника.",
+            "Пока вижу только одного участника. Перешли хотя бы одно сообщение второго человека.",
             reply_markup=preview_keyboard
         )
 
 
-def calculate_dialog_metrics(messages, selected_user):
-    user_messages = []
-    other_messages = []
+def calculate_dialog_metrics(messages):
+    user_count = 0
+    other_count = 0
+    user_words = 0
+    other_words = 0
+    user_questions = 0
+    other_questions = 0
 
-    for m in messages:
-        text = m["text"]
-        if m["text"].startswith("Ты:"):
-            user_messages.append(text)
+    for message in messages:
+        text = message["text"]
+        _, _, content = text.partition(": ")
+        message_text = content or text
+        word_count = len(message_text.split())
+        has_question = "?" in message_text
+
+        if text.startswith("Ты:"):
+            user_count += 1
+            user_words += word_count
+            user_questions += int(has_question)
         else:
-            other_messages.append(text)
-
-    user_count = len(user_messages)
-    other_count = len(other_messages)
-
-    user_words = sum(len(m.split()) for m in user_messages)
-    other_words = sum(len(m.split()) for m in other_messages)
+            other_count += 1
+            other_words += word_count
+            other_questions += int(has_question)
 
     user_avg_len = user_words // user_count if user_count else 0
     other_avg_len = other_words // other_count if other_count else 0
-
-    user_questions = sum("?" in m for m in user_messages)
-    other_questions = sum("?" in m for m in other_messages)
-
     starter = "пользователь" if messages[0]["text"].startswith("Ты:") else "собеседник"
 
     metrics = f"""
@@ -286,6 +379,39 @@ def calculate_dialog_metrics(messages, selected_user):
 """
 
     return metrics
+
+
+def build_dialog_excerpt(messages: list[dict], max_chars: int) -> tuple[str, bool]:
+    lines = [message["text"] for message in messages]
+    full_dialog = "\n".join(lines)
+    if len(full_dialog) <= max_chars:
+        return full_dialog, False
+
+    head_limit = min(8, len(lines))
+    head_lines = lines[:head_limit]
+    head_text = "\n".join(head_lines)
+    separator = "\n[... часть переписки сокращена, чтобы не перегружать анализ ...]\n"
+
+    remaining_chars = max_chars - len(head_text) - len(separator)
+    if remaining_chars <= 0:
+        shortened_head = head_text[:max_chars].rstrip()
+        return shortened_head, True
+
+    tail_lines: list[str] = []
+    used_chars = 0
+    for line in reversed(lines[head_limit:]):
+        line_size = len(line) + (1 if tail_lines else 0)
+        if used_chars + line_size > remaining_chars:
+            break
+        tail_lines.append(line)
+        used_chars += line_size
+
+    tail_lines.reverse()
+    if not tail_lines:
+        shortened_head = head_text[:max_chars].rstrip()
+        return shortened_head, True
+
+    return head_text + separator + "\n".join(tail_lines), True
 
 @dp.message(F.text == "Закончить и проанализировать")
 async def finish_handler(message: Message, state: FSMContext):
@@ -310,7 +436,7 @@ async def finish_handler(message: Message, state: FSMContext):
         await state.clear()
         return
     
-    messages = data.get("messages", [])
+    messages = sorted(data.get("messages", []), key=lambda item: item["date"])
     selected_user = data.get("selected_user")
     participants = data.get("participants", [])
 
@@ -321,33 +447,72 @@ async def finish_handler(message: Message, state: FSMContext):
         )
         return
 
-    messages.sort(key=lambda x: x["date"])
+    user = message.from_user
+    if user is not None and ANALYSIS_COOLDOWN_SECONDS > 0:
+        now = time.monotonic()
+        available_at = analysis_cooldowns.get(user.id, 0.0)
+        remaining_seconds = int(available_at - now)
+        if remaining_seconds > 0:
+            await message.answer(
+                f"Новый анализ можно запустить через {remaining_seconds} сек.",
+                reply_markup=collect_keyboard
+            )
+            return
 
-    other_participants = [p for p in participants if p != selected_user]
-    other_name = other_participants[0] if other_participants else "Собеседник"
+        analysis_cooldowns[user.id] = now + ANALYSIS_COOLDOWN_SECONDS
+
+    other_name = next((participant for participant in participants if participant != selected_user), "Собеседник")
+    dialog_excerpt, was_truncated = build_dialog_excerpt(messages, MAX_ANALYSIS_TEXT_CHARS)
 
     full_text = (
         f"Пользователь бота: {selected_user}\n"
         f"Собеседник: {other_name}\n\n"
         "Диалог:\n"
-        + "\n".join(m["text"] for m in messages)
+        + dialog_excerpt
     )
+
+    if was_truncated:
+        full_text += "\n\nПримечание: длинная переписка была сокращена, сохранив начало и последние сообщения."
 
     await message.answer("🧠 Анализирую переписку...\nЭто может занять несколько секунд.")
 
     try:
-        metrics = calculate_dialog_metrics(messages, selected_user)
-        analysis = analyze_chat(
-            "КОНТЕКСТ ДИАЛОГА:\n"
-            + full_text
-            + "\n\nМЕТРИКИ ДИАЛОГА:\n"
-            + metrics
-        )
+        metrics = calculate_dialog_metrics(messages)
+        try:
+            await asyncio.wait_for(
+                analysis_semaphore.acquire(),
+                timeout=ANALYSIS_QUEUE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await message.answer(
+                "Сервис сейчас перегружен. Подожди немного и попробуй снова.",
+                reply_markup=result_keyboard
+            )
+            return
+
+        try:
+            analysis = await asyncio.wait_for(
+                analyze_chat(
+                    "КОНТЕКСТ ДИАЛОГА:\n"
+                    + full_text
+                    + "\n\nМЕТРИКИ ДИАЛОГА:\n"
+                    + metrics
+                ),
+                timeout=ANALYSIS_TIMEOUT_SECONDS
+            )
+        finally:
+            analysis_semaphore.release()
+
         await message.answer(analysis, reply_markup=result_keyboard)
-    except Exception:
+    except asyncio.TimeoutError:
         await message.answer(
-            "Сейчас не могу выполнить анализ. "
-            "Проверь лимит и попробуй снова.",
+            "Сервис анализа сейчас отвечает слишком долго. Попробуй ещё раз через минуту.",
+            reply_markup=result_keyboard
+        )
+    except Exception as e:
+        logger.exception("Analysis failed")
+        await message.answer(
+            f"Ошибка анализа: {type(e).__name__}: {e}",
             reply_markup=result_keyboard
         )
 
@@ -378,13 +543,13 @@ async def collect_messages_handler(message: Message, state: FSMContext):
     if limit_exceeded:
         return
 
-    if len(messages) >= 60:
+    if len(messages) >= MAX_DIALOG_MESSAGES:
         await state.update_data(limit_exceeded=True)
 
         if not limit_notified:
             await state.update_data(limit_notified=True)
             await message.answer(
-                "Ты превысил лимит — 60 сообщений за один анализ.\n"
+                f"Ты превысил лимит — {MAX_DIALOG_MESSAGES} сообщений за один анализ.\n"
                 "Этот анализ отменён. Нажми «Разобрать переписку» и отправь переписку заново в пределах лимита.",
                 reply_markup=start_keyboard
             )
@@ -431,11 +596,20 @@ async def fallback_handler(message: Message):
 
 
 async def main():
+    configure_logging()
+    logger.info("Starting Telegram bot")
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except Exception:
+        logger.exception("Bot stopped because of an unhandled exception")
+        raise
+    finally:
+        logger.info("Stopping Telegram bot")
+        await bot.session.close()
 
 
 if __name__ == "__main__":
