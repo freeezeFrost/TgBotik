@@ -6,3 +6,5 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+bot_data.sqlite3
+*.sqlite3
