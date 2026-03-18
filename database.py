@@ -4,7 +4,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 DB_PATH = Path(__file__).with_name("bot_data.sqlite3")
 
 
@@ -51,6 +50,23 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_access (
+                user_id INTEGER PRIMARY KEY,
+                access_role TEXT NOT NULL DEFAULT 'user',
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                free_initial_used INTEGER NOT NULL DEFAULT 0,
+                free_followup_used INTEGER NOT NULL DEFAULT 0,
+                paid_credits INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         existing_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(analysis_runs)")
         }
@@ -93,6 +109,254 @@ def init_db() -> None:
             ON analysis_run_messages (run_id, scope, position)
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_access_updated
+            ON user_access (updated_at DESC)
+            """
+        )
+        access_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(user_access)")
+        }
+        access_required_columns = {
+            "access_role": "TEXT NOT NULL DEFAULT 'user'",
+            "username": "TEXT",
+            "first_name": "TEXT",
+            "last_name": "TEXT",
+            "free_initial_used": "INTEGER NOT NULL DEFAULT 0",
+            "free_followup_used": "INTEGER NOT NULL DEFAULT 0",
+            "paid_credits": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "INTEGER NOT NULL DEFAULT 0",
+            "last_seen_at": "INTEGER NOT NULL DEFAULT 0",
+            "updated_at": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, column_type in access_required_columns.items():
+            if column_name not in access_columns:
+                connection.execute(
+                    f"ALTER TABLE user_access ADD COLUMN {column_name} {column_type}"
+                )
+
+
+def ensure_user_access(connection: sqlite3.Connection, user_id: int) -> None:
+    now = int(time.time())
+    connection.execute(
+        """
+        INSERT INTO user_access (
+            user_id,
+            access_role,
+            username,
+            first_name,
+            last_name,
+            free_initial_used,
+            free_followup_used,
+            paid_credits,
+            created_at,
+            last_seen_at,
+            updated_at
+        )
+        VALUES (?, 'user', NULL, NULL, NULL, 0, 0, 0, ?, ?, ?)
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+        (user_id, now, now, now),
+    )
+
+
+def get_user_access(user_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        row = connection.execute(
+            """
+            SELECT
+                user_id,
+                access_role,
+                username,
+                first_name,
+                last_name,
+                free_initial_used,
+                free_followup_used,
+                paid_credits,
+                last_seen_at
+            FROM user_access
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+        if row is None:
+            return {
+                "user_id": user_id,
+                "access_role": "user",
+                "username": None,
+                "first_name": None,
+                "last_name": None,
+                "free_initial_used": 0,
+                "free_followup_used": 0,
+                "paid_credits": 0,
+                "last_seen_at": 0,
+            }
+
+        return {
+            "user_id": row["user_id"],
+            "access_role": row["access_role"] or "user",
+            "username": row["username"],
+            "first_name": row["first_name"],
+            "last_name": row["last_name"],
+            "free_initial_used": int(row["free_initial_used"] or 0),
+            "free_followup_used": int(row["free_followup_used"] or 0),
+            "paid_credits": int(row["paid_credits"] or 0),
+            "last_seen_at": int(row["last_seen_at"] or 0),
+        }
+
+
+def touch_user_access(
+    user_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+) -> None:
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        connection.execute(
+            """
+            UPDATE user_access
+            SET username = ?,
+                first_name = ?,
+                last_name = ?,
+                last_seen_at = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                username,
+                first_name,
+                last_name,
+                int(time.time()),
+                int(time.time()),
+                user_id,
+            ),
+        )
+
+
+def can_use_reply_variants(user_id: int) -> bool:
+    access = get_user_access(user_id)
+    return str(access.get("access_role", "user")) in {"owner", "vip"} or int(access.get("paid_credits", 0)) > 0
+
+
+def set_access_role(user_id: int, access_role: str) -> None:
+    normalized_role = access_role.strip().lower()
+    if normalized_role not in {"owner", "vip", "user"}:
+        raise ValueError("access_role must be one of: owner, vip, user")
+
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        connection.execute(
+            """
+            UPDATE user_access
+            SET access_role = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (normalized_role, int(time.time()), user_id),
+        )
+
+
+def list_known_users(limit: int = 20) -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                user_id,
+                access_role,
+                username,
+                first_name,
+                last_name,
+                paid_credits,
+                free_followup_used,
+                last_seen_at
+            FROM user_access
+            ORDER BY last_seen_at DESC, updated_at DESC, user_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        return [
+            {
+                "user_id": row["user_id"],
+                "access_role": row["access_role"] or "user",
+                "username": row["username"],
+                "first_name": row["first_name"],
+                "last_name": row["last_name"],
+                "paid_credits": int(row["paid_credits"] or 0),
+                "free_followup_used": int(row["free_followup_used"] or 0),
+                "last_seen_at": int(row["last_seen_at"] or 0),
+            }
+            for row in rows
+        ]
+
+
+def mark_free_initial_used(user_id: int) -> None:
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        connection.execute(
+            """
+            UPDATE user_access
+            SET free_initial_used = 1,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (int(time.time()), user_id),
+        )
+
+
+def mark_free_followup_used(user_id: int) -> None:
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        connection.execute(
+            """
+            UPDATE user_access
+            SET free_followup_used = 1,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (int(time.time()), user_id),
+        )
+
+
+def add_paid_credits(user_id: int, amount: int) -> None:
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        connection.execute(
+            """
+            UPDATE user_access
+            SET paid_credits = paid_credits + ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (amount, int(time.time()), user_id),
+        )
+
+
+def consume_paid_credit(user_id: int, amount: int = 1) -> bool:
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+
+    with get_connection() as connection:
+        ensure_user_access(connection, user_id)
+        cursor = connection.execute(
+            """
+            UPDATE user_access
+            SET paid_credits = paid_credits - ?,
+                updated_at = ?
+            WHERE user_id = ?
+              AND paid_credits >= ?
+            """,
+            (amount, int(time.time()), user_id, amount),
+        )
+        return cursor.rowcount > 0
 
 
 def serialize_message_key(message: dict[str, Any]) -> str | None:

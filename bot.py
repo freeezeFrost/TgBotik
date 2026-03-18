@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import json
 import logging
@@ -10,7 +11,7 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.memory import SimpleEventIsolation
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
@@ -30,14 +31,28 @@ from config import (
     MAX_ANALYSIS_TEXT_CHARS,
     MAX_DIALOG_MESSAGES,
     MAX_CONCURRENT_ANALYSES,
+    MAX_VIDEO_NOTE_DURATION_SECONDS,
     MIN_VOICE_DURATION_SECONDS,
     MAX_VOICE_DURATION_SECONDS,
     MESSAGE_RATE_LIMIT_COUNT,
     MESSAGE_RATE_LIMIT_NOTICE_COOLDOWN,
     MESSAGE_RATE_LIMIT_WINDOW_SECONDS,
 )
-from ai_analyzer import analyze_chat, analyze_followup, transcribe_voice
-from database import get_analysis_run_by_id, get_latest_analysis_run, init_db, save_analysis_run
+from ai_analyzer import analyze_chat, analyze_followup, generate_reply_variants, transcribe_voice
+from database import (
+    can_use_reply_variants,
+    consume_paid_credit,
+    get_analysis_run_by_id,
+    get_latest_analysis_run,
+    get_user_access,
+    init_db,
+    list_known_users,
+    mark_free_followup_used,
+    mark_free_initial_used,
+    save_analysis_run,
+    set_access_role,
+    touch_user_access,
+)
 
 
 def configure_logging() -> None:
@@ -61,6 +76,17 @@ def configure_logging() -> None:
 
 
 logger = logging.getLogger(__name__)
+
+
+def is_collection_state(state_name: str | None) -> bool:
+    if not state_name:
+        return False
+
+    return state_name.endswith((
+        "collecting_preview",
+        "collecting_messages",
+        "collecting_followup",
+    ))
 
 
 class AntiSpamMiddleware(BaseMiddleware):
@@ -89,6 +115,21 @@ class AntiSpamMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
 
+        try:
+            touch_user_access(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+            )
+        except Exception:
+            logger.exception("Failed to update known user info for user_id=%s", user.id)
+
+        state: FSMContext | None = data.get("state")
+        current_state = await state.get_state() if state is not None else None
+        if is_collection_state(current_state):
+            return await handler(event, data)
+
         now = time.monotonic()
         timestamps = self.user_events[user.id]
         cutoff = now - self.window_seconds
@@ -103,7 +144,7 @@ class AntiSpamMiddleware(BaseMiddleware):
                 await event.answer(
                     "Слишком много сообщений за короткое время. Подожди несколько секунд и продолжай."
                 )
-            logger.warning("Rate limit triggered for user_id=%s", user.id)
+                logger.warning("Rate limit triggered for user_id=%s", user.id)
             return None
 
         timestamps.append(now)
@@ -130,6 +171,12 @@ BUTTON_ANALYZE = "Разобрать переписку"
 BUTTON_NEW_ANALYSIS = "Новый анализ"
 BUTTON_FOLLOWUP = "Ответил — проверить что изменилось"
 BUTTON_FINISH_FOLLOWUP = "Проверить что изменилось"
+BUTTON_DONE_ACTION = "Я сделал"
+BUTTON_OTHER_VARIANT = "Хочу другой вариант"
+BUTTON_REPLY_VARIANTS = "3 варианта ответа"
+BUTTON_CONTINUE = "Продолжить"
+PAID_CREDIT_COST = 1
+CREDIT_PACK_OPTIONS = (1, 5, 10)
 
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -155,9 +202,18 @@ preview_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-result_keyboard = ReplyKeyboardMarkup(
+initial_result_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BUTTON_FOLLOWUP)],
+        [KeyboardButton(text=BUTTON_DONE_ACTION), KeyboardButton(text=BUTTON_OTHER_VARIANT)],
+        [KeyboardButton(text=BUTTON_REPLY_VARIANTS)],
+        [KeyboardButton(text=BUTTON_NEW_ANALYSIS)]
+    ],
+    resize_keyboard=True
+)
+
+followup_result_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BUTTON_CONTINUE)],
         [KeyboardButton(text=BUTTON_NEW_ANALYSIS)]
     ],
     resize_keyboard=True
@@ -181,6 +237,62 @@ class AnalyzeState(StatesGroup):
 
 class VoiceProcessingError(Exception):
     pass
+
+
+def has_unlimited_access(access_state: dict[str, Any]) -> bool:
+    return str(access_state.get("access_role", "user")) in {"owner", "vip"}
+
+
+def is_free_followup_available(access_state: dict[str, Any]) -> bool:
+    return int(access_state.get("free_followup_used", 0)) == 0
+
+
+def has_paid_credit(access_state: dict[str, Any], required: int = PAID_CREDIT_COST) -> bool:
+    return int(access_state.get("paid_credits", 0)) >= required
+
+
+def build_credit_packages_text() -> str:
+    return "\n".join(f"• {credits} проверка" if credits == 1 else f"• {credits} проверок" for credits in CREDIT_PACK_OPTIONS)
+
+
+def build_paywall_message(feature_name: str, access_state: dict[str, Any]) -> str:
+    free_followup_text = "ещё доступен" if is_free_followup_available(access_state) else "уже использован"
+    credits = int(access_state.get("paid_credits", 0))
+
+    return (
+        f"<b>{feature_name} — платная функция</b>\n\n"
+        f"Для этого действия нужен {PAID_CREDIT_COST} кредит.\n"
+        "Первый разбор остаётся бесплатным.\n"
+        "Первый follow-up после твоего действия можно проверить бесплатно один раз.\n\n"
+        "<b>Сейчас у тебя:</b>\n"
+        f"• кредитов: {credits}\n"
+        f"• бесплатный follow-up: {free_followup_text}\n\n"
+        "<b>Пакеты кредитов:</b>\n"
+        f"{build_credit_packages_text()}"
+    )
+
+
+def format_known_user_line(user_row: dict[str, Any]) -> str:
+    user_id = user_row["user_id"]
+    access_role = str(user_row.get("access_role", "user"))
+    username = user_row.get("username")
+    first_name = user_row.get("first_name") or ""
+    last_name = user_row.get("last_name") or ""
+    full_name = f"{first_name} {last_name}".strip()
+    last_seen_at = int(user_row.get("last_seen_at", 0) or 0)
+    last_seen_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen_at)) if last_seen_at else "неизвестно"
+    username_text = f"@{username}" if username else "без username"
+    name_text = html.escape(full_name) if full_name else "без имени"
+    credits = int(user_row.get("paid_credits", 0) or 0)
+
+    return (
+        f"• <code>{user_id}</code> | {html.escape(username_text)} | {name_text}\n"
+        f"роль: <b>{html.escape(access_role)}</b>, кредиты: {credits}, был: {last_seen_text}"
+    )
+
+
+def is_owner(access_state: dict[str, Any]) -> bool:
+    return str(access_state.get("access_role", "user")) == "owner"
 
 
 VOICE_FILLER_WORDS = {
@@ -505,6 +617,72 @@ def format_messages_for_prompt(messages: list[dict]) -> str:
     return "\n".join(message["text"] for message in messages)
 
 
+def extract_analysis_section(text: str, title: str) -> str | None:
+    match = re.search(
+        rf"(?:^|\n)[^\n]*{re.escape(title)}\n(?P<body>.*?)(?=\n━━━━━━━━━━━━━━\n|\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+
+    body = match.group("body").strip()
+    return body or None
+
+
+def normalize_section_lines(section_text: str | None, max_lines: int = 3) -> list[str]:
+    if not section_text:
+        return []
+
+    normalized_lines: list[str] = []
+    for raw_line in section_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized_lines.append(line)
+        if len(normalized_lines) >= max_lines:
+            break
+    return normalized_lines
+
+
+def build_initial_action_card(analysis: str) -> str:
+    action_lines = normalize_section_lines(extract_analysis_section(analysis, "Что делать сейчас"))
+    if not action_lines:
+        action_lines = ["Сделай то, что указано в блоке «Что делать сейчас»."]
+
+    return (
+        "🎯 <b>Что делать:</b>\n"
+        + "\n".join(action_lines)
+        + "\n\n<i>Первая проверка после действия — бесплатно один раз. "
+        "Другой вариант и 3 варианта ответа — по кредитам.</i>"
+        + "\n\n👇\n"
+        f"[{BUTTON_DONE_ACTION}]   [{BUTTON_OTHER_VARIANT}]   [{BUTTON_REPLY_VARIANTS}]"
+    )
+
+
+def build_followup_outcome_card(
+    interest_before: int | None,
+    interest_after: int | None,
+    advice_effectiveness: str | None,
+) -> str:
+    before_text = f"{interest_before}/10" if interest_before is not None else "не извлечено"
+    after_text = f"{interest_after}/10" if interest_after is not None else "не извлечено"
+    outcome_map = {
+        "сработал": "👉 Сработало",
+        "частично": "👉 Сработало частично",
+        "не сработал": "👉 Не сработало",
+        None: "👉 Пока без ясного сигнала",
+    }
+
+    return (
+        f"↘️ ДО: {before_text}\n"
+        f"📈 ПОСЛЕ: {after_text}\n\n"
+        f"{outcome_map.get(advice_effectiveness, outcome_map[None])}\n\n"
+        "<i>Следующая проверка изменений откроется по кредиту.</i>\n\n"
+        f"👇\n[{BUTTON_CONTINUE}]   [{BUTTON_NEW_ANALYSIS}]"
+    )
+
+
 def merge_messages(existing: list[dict], new_messages: list[dict]) -> list[dict]:
     merged = list(existing)
     known_pairs = {build_message_key(item) for item in merged}
@@ -587,6 +765,74 @@ async def transcribe_voice_message(message: Message) -> str:
     return f"[голосовое] {transcript}"
 
 
+async def transcribe_video_note_message(message: Message) -> str:
+    video_note = message.video_note
+    if video_note is None:
+        raise VoiceProcessingError("Кружок не найден.")
+
+    if video_note.duration < MIN_VOICE_DURATION_SECONDS:
+        raise VoiceProcessingError(
+            "Слишком короткий кружок. Короткие ответы вроде «да» и «угу» лучше пересылать текстом."
+        )
+
+    if video_note.duration > MAX_VIDEO_NOTE_DURATION_SECONDS:
+        raise VoiceProcessingError(
+            f"Кружок длиннее {MAX_VIDEO_NOTE_DURATION_SECONDS} сек. "
+            "Отправь более короткий кружок, голосовое или текст."
+        )
+
+    await message.answer(
+        "Распознаю кружок...\n"
+        "Это может занять несколько секунд."
+    )
+
+    video_bytes = io.BytesIO()
+    video_bytes.name = f"video_note_{message.message_id}.mp4"
+
+    try:
+        await message.bot.download(video_note, destination=video_bytes)
+    except Exception as exc:
+        logger.exception("Failed to download video note")
+        raise VoiceProcessingError(
+            "Не удалось скачать кружок. Перешли его ещё раз."
+        ) from exc
+
+    try:
+        await asyncio.wait_for(
+            analysis_semaphore.acquire(),
+            timeout=ANALYSIS_QUEUE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError as exc:
+        raise VoiceProcessingError(
+            "Сервис распознавания сейчас перегружен. Подожди немного и попробуй снова."
+        ) from exc
+
+    try:
+        transcript = await asyncio.wait_for(
+            transcribe_voice(video_bytes.name, video_bytes.getvalue()),
+            timeout=ANALYSIS_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError as exc:
+        raise VoiceProcessingError(
+            "Распознавание кружка заняло слишком много времени. Попробуй ещё раз."
+        ) from exc
+    except Exception as exc:
+        logger.exception("Video note transcription failed")
+        raise VoiceProcessingError(
+            "Не удалось распознать кружок. Попробуй ещё раз или перешли текст."
+        ) from exc
+    finally:
+        analysis_semaphore.release()
+
+    if is_low_signal_transcript(transcript):
+        raise VoiceProcessingError(
+            "В кружке слишком мало смысла для анализа: похоже на короткий ответ, мусорную фразу или шум. "
+            "Перешли более содержательный фрагмент или текст."
+        )
+
+    return f"[кружок] {transcript}"
+
+
 async def extract_message_text(message: Message) -> str | None:
     raw_text = extract_text(message)
     if raw_text:
@@ -594,6 +840,9 @@ async def extract_message_text(message: Message) -> str | None:
 
     if message.voice:
         return await transcribe_voice_message(message)
+
+    if message.video_note:
+        return await transcribe_video_note_message(message)
 
     return None
 
@@ -607,6 +856,106 @@ def build_role_keyboard(participants: list[str]) -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
+
+@dp.message(Command("myid"))
+async def myid_handler(message: Message):
+    user = message.from_user
+    if user is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    access_state = get_user_access(user.id)
+    username_text = f"@{user.username}" if user.username else "не указан"
+
+    await message.answer(
+        "<b>Твой Telegram ID</b>\n\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"Username: {html.escape(username_text)}\n"
+        f"Роль доступа: <b>{html.escape(str(access_state.get('access_role', 'user')))}</b>\n\n"
+        "Перешли этот ID мне, если я должен выдать тебе доступ."
+    )
+
+
+@dp.message(Command("users"))
+async def users_handler(message: Message):
+    user = message.from_user
+    if user is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    access_state = get_user_access(user.id)
+    if not is_owner(access_state):
+        await message.answer("Эта команда доступна только owner.")
+        return
+
+    known_users = list_known_users(limit=20)
+    if not known_users:
+        await message.answer("Пока никто ещё не писал боту.")
+        return
+
+    lines = ["<b>Последние известные пользователи</b>"]
+    for item in known_users:
+        lines.append(format_known_user_line(item))
+
+    await message.answer("\n\n".join(lines))
+
+
+@dp.message(Command("grant"))
+async def grant_handler(message: Message):
+    user = message.from_user
+    if user is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    access_state = get_user_access(user.id)
+    if not is_owner(access_state):
+        await message.answer("Эта команда доступна только owner.")
+        return
+
+    raw_text = (message.text or "").strip()
+    parts = raw_text.split()
+    if len(parts) != 3:
+        await message.answer(
+            "<b>Как использовать</b>\n\n"
+            "<code>/grant 123456789 vip</code>\n"
+            "<code>/grant 123456789 owner</code>\n"
+            "<code>/grant 123456789 user</code>\n\n"
+            "Роль <b>user</b> снимает расширенный доступ."
+        )
+        return
+
+    _, raw_user_id, raw_role = parts
+
+    try:
+        target_user_id = int(raw_user_id)
+    except ValueError:
+        await message.answer("ID должен быть целым числом.")
+        return
+
+    normalized_role = raw_role.strip().lower()
+    if normalized_role not in {"owner", "vip", "user"}:
+        await message.answer("Роль должна быть одной из: owner, vip, user.")
+        return
+
+    try:
+        set_access_role(target_user_id, normalized_role)
+    except Exception as exc:
+        logger.exception("Failed to grant access role")
+        await message.answer(f"Не удалось обновить доступ: {type(exc).__name__}: {exc}")
+        return
+
+    updated_state = get_user_access(target_user_id)
+    username = updated_state.get("username")
+    username_text = f"@{username}" if username else "без username"
+
+    await message.answer(
+        "<b>Доступ обновлён</b>\n\n"
+        f"ID: <code>{target_user_id}</code>\n"
+        f"Username: {html.escape(username_text)}\n"
+        f"Новая роль: <b>{html.escape(str(updated_state.get('access_role', 'user')))}</b>"
+    )
+
+
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -616,13 +965,13 @@ async def start_handler(message: Message, state: FSMContext):
         "есть ли реальный интерес, кто в сильной позиции и что на самом деле происходит между вами.\n\n"
         "<b>Как начать:</b>\n"
         "1. Нажми <b>Старт</b>\n"
-        "2. Перешли 2–4 сообщения или голосовых, чтобы я определил участников\n"
+        "2. Перешли 2–4 сообщения, голосовых или кружка, чтобы я определил участников\n"
         "3. Затем отправь остальную переписку и запусти анализ",
         reply_markup=start_keyboard
     )
 
 
-@dp.message(F.text == BUTTON_FOLLOWUP)
+@dp.message(F.text.in_([BUTTON_FOLLOWUP, BUTTON_DONE_ACTION, BUTTON_CONTINUE]))
 async def followup_button_handler(message: Message, state: FSMContext):
     user = message.from_user
     if user is None:
@@ -637,11 +986,27 @@ async def followup_button_handler(message: Message, state: FSMContext):
         )
         return
 
+    access_state = get_user_access(user.id)
+    if has_unlimited_access(access_state):
+        followup_access_mode = "unlimited"
+    elif is_free_followup_available(access_state):
+        followup_access_mode = "free"
+    elif has_paid_credit(access_state):
+        followup_access_mode = "paid"
+    else:
+        await message.answer(
+            build_paywall_message("Повторная проверка после действия", access_state),
+            reply_markup=followup_result_keyboard,
+        )
+        return
+
     await state.set_state(AnalyzeState.collecting_followup)
     await state.update_data(
         followup_messages=[],
         followup_source_run_id=latest_run["id"],
+        followup_access_mode=followup_access_mode,
         followup_last_progress_count=0,
+        followup_progress_hint_sent=False,
         followup_limit_notified=False,
         followup_limit_exceeded=False,
     )
@@ -665,6 +1030,7 @@ async def analyze_button_handler(message: Message, state: FSMContext):
         messages=[],
         selected_user=None,
         last_progress_count=0,
+        progress_hint_sent=False,
         base_messages_count=0,
         limit_notified=False,
         role_prompt_sent=False,
@@ -673,9 +1039,207 @@ async def analyze_button_handler(message: Message, state: FSMContext):
 
     await message.answer(
         "<b>Шаг 1 из 2</b>\n\n"
-        "Перешли 2–4 сообщения или голосовых из переписки, чтобы я определил участников.",
+        "Перешли 2–4 сообщения, голосовых или кружка из переписки, чтобы я определил участников.",
         reply_markup=preview_keyboard
     )
+
+
+@dp.message(F.text == BUTTON_OTHER_VARIANT)
+async def other_variant_handler(message: Message, state: FSMContext):
+    user = message.from_user
+    if user is None:
+        await message.answer("Не удалось определить пользователя. Попробуй ещё раз.")
+        return
+
+    latest_run = get_latest_analysis_run(user.id, run_type="initial")
+    if latest_run is None:
+        await message.answer(
+            "Сначала нужен хотя бы один готовый анализ. Нажми <b>Старт</b> и сделай первый разбор.",
+            reply_markup=start_keyboard
+        )
+        return
+
+    access_state = get_user_access(user.id)
+    if not has_unlimited_access(access_state) and not has_paid_credit(access_state):
+        await message.answer(
+            build_paywall_message("Другой вариант действия", access_state),
+            reply_markup=initial_result_keyboard,
+        )
+        return
+
+    selected_user = latest_run.get("selected_user")
+    participants = latest_run.get("participants", [])
+    messages = latest_run.get("messages", [])
+    previous_analysis = latest_run.get("analysis", "")
+    other_name = next((participant for participant in participants if participant != selected_user), "Собеседник")
+    dialog_excerpt, was_truncated = build_dialog_excerpt(messages, MAX_ANALYSIS_TEXT_CHARS)
+
+    variant_prompt = (
+        f"Пользователь бота: {selected_user}\n"
+        f"Собеседник: {other_name}\n\n"
+        "Предыдущий анализ, который уже был дан:\n"
+        f"{previous_analysis}\n\n"
+        "Дай другой вариант действия и другой текст ответа.\n"
+        "Не повторяй прошлый совет дословно.\n"
+        "Если по диалогу нужен не новый вариант, а прекращение общения — скажи это прямо.\n\n"
+        "Диалог:\n"
+        f"{dialog_excerpt}"
+    )
+
+    if was_truncated:
+        variant_prompt += "\n\nПримечание: длинная переписка была сокращена."
+
+    await message.answer(
+        "Подбираю другой вариант действия...\n"
+        "Это может занять несколько секунд."
+    )
+
+    try:
+        try:
+            await asyncio.wait_for(
+                analysis_semaphore.acquire(),
+                timeout=ANALYSIS_QUEUE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await message.answer(
+                "Сервис сейчас перегружен. Подожди немного и попробуй снова.",
+                reply_markup=initial_result_keyboard
+            )
+            return
+
+        try:
+            analysis = await asyncio.wait_for(
+                analyze_chat(variant_prompt),
+                timeout=ANALYSIS_TIMEOUT_SECONDS
+            )
+        finally:
+            analysis_semaphore.release()
+
+        if not has_unlimited_access(access_state) and not consume_paid_credit(user.id, PAID_CREDIT_COST):
+            await message.answer(
+                build_paywall_message("Другой вариант действия", get_user_access(user.id)),
+                reply_markup=initial_result_keyboard,
+            )
+            return
+
+        save_analysis_run(
+            user_id=user.id,
+            run_type="initial",
+            payload={
+                "selected_user": selected_user,
+                "participants": participants,
+                "messages": messages,
+                "analysis": analysis,
+                "interest_score": parse_interest_score(analysis),
+                "interest_score_after": parse_interest_score(analysis),
+            },
+        )
+
+        await message.answer(analysis, reply_markup=initial_result_keyboard)
+        await message.answer(build_initial_action_card(analysis), reply_markup=initial_result_keyboard)
+    except asyncio.TimeoutError:
+        await message.answer(
+            "Сервис анализа сейчас отвечает слишком долго. Попробуй ещё раз через минуту.",
+            reply_markup=initial_result_keyboard
+        )
+    except Exception as exc:
+        logger.exception("Alternative analysis failed")
+        await message.answer(
+            f"Ошибка подбора другого варианта: {type(exc).__name__}: {exc}",
+            reply_markup=initial_result_keyboard
+        )
+
+
+@dp.message(F.text == BUTTON_REPLY_VARIANTS)
+async def reply_variants_handler(message: Message, state: FSMContext):
+    user = message.from_user
+    if user is None:
+        await message.answer("Не удалось определить пользователя. Попробуй ещё раз.")
+        return
+
+    latest_run = get_latest_analysis_run(user.id, run_type="initial")
+    if latest_run is None:
+        await message.answer(
+            "Сначала нужен хотя бы один готовый анализ. Нажми <b>Старт</b> и сделай первый разбор.",
+            reply_markup=start_keyboard
+        )
+        return
+
+    access_state = get_user_access(user.id)
+    if not can_use_reply_variants(user.id):
+        await message.answer(
+            "Хочешь увидеть сильные варианты ответа — нужен доступ.\n\n"
+            "Это то, что реально меняет исход диалога.\n\n"
+            + build_paywall_message("3 варианта ответа", access_state),
+            reply_markup=initial_result_keyboard,
+        )
+        return
+
+    selected_user = latest_run.get("selected_user")
+    participants = latest_run.get("participants", [])
+    messages = latest_run.get("messages", [])
+    analysis = latest_run.get("analysis", "")
+    other_name = next((participant for participant in participants if participant != selected_user), "Собеседник")
+    dialog_excerpt, was_truncated = build_dialog_excerpt(messages, MAX_ANALYSIS_TEXT_CHARS)
+
+    variants_prompt = (
+        f"Пользователь бота: {selected_user}\n"
+        f"Собеседник: {other_name}\n\n"
+        "Готовый разбор переписки:\n"
+        f"{analysis}\n\n"
+        "Сделай 3 разных варианта ответа на основе этого разбора.\n\n"
+        "Диалог:\n"
+        f"{dialog_excerpt}"
+    )
+
+    if was_truncated:
+        variants_prompt += "\n\nПримечание: длинная переписка была сокращена."
+
+    await message.answer(
+        "Готовлю 3 варианта ответа...\n"
+        "Это может занять несколько секунд."
+    )
+
+    try:
+        try:
+            await asyncio.wait_for(
+                analysis_semaphore.acquire(),
+                timeout=ANALYSIS_QUEUE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await message.answer(
+                "Сервис сейчас перегружен. Подожди немного и попробуй снова.",
+                reply_markup=initial_result_keyboard
+            )
+            return
+
+        try:
+            variants = await asyncio.wait_for(
+                generate_reply_variants(variants_prompt),
+                timeout=ANALYSIS_TIMEOUT_SECONDS
+            )
+        finally:
+            analysis_semaphore.release()
+
+        if not has_unlimited_access(access_state) and not consume_paid_credit(user.id, PAID_CREDIT_COST):
+            await message.answer(
+                build_paywall_message("3 варианта ответа", get_user_access(user.id)),
+                reply_markup=initial_result_keyboard,
+            )
+            return
+
+        await message.answer(variants, reply_markup=initial_result_keyboard)
+    except asyncio.TimeoutError:
+        await message.answer(
+            "Сервис сейчас отвечает слишком долго. Попробуй ещё раз через минуту.",
+            reply_markup=initial_result_keyboard
+        )
+    except Exception as exc:
+        logger.exception("Reply variants generation failed")
+        await message.answer(
+            f"Ошибка генерации вариантов: {type(exc).__name__}: {exc}",
+            reply_markup=initial_result_keyboard
+        )
 
 @dp.message(AnalyzeState.choosing_role)
 async def choose_role_handler(message: Message, state: FSMContext):
@@ -709,6 +1273,7 @@ async def choose_role_handler(message: Message, state: FSMContext):
         selected_user=selected_user,
         messages=converted_messages,
         last_progress_count=0,
+        progress_hint_sent=False,
         base_messages_count=len(converted_messages),
         limit_notified=False,
         limit_exceeded=False
@@ -743,7 +1308,7 @@ async def collect_preview_handler(message: Message, state: FSMContext):
     sender_name = extract_sender_name(message)
     if not sender_name:
         await message.answer(
-            "На этом этапе перешли сообщения или голосовые именно из переписки, "
+            "На этом этапе перешли сообщения, голосовые или кружки именно из переписки, "
             "чтобы я увидел участников.",
             reply_markup=preview_keyboard
         )
@@ -757,7 +1322,7 @@ async def collect_preview_handler(message: Message, state: FSMContext):
 
     if not raw_text:
         await message.answer(
-            "На этом этапе перешли сообщения из переписки: текст, подпись или голосовое.",
+            "На этом этапе перешли сообщения из переписки: текст, подпись, голосовое или кружок.",
             reply_markup=preview_keyboard
         )
         return
@@ -1021,7 +1586,7 @@ async def finish_handler(message: Message, state: FSMContext):
         except asyncio.TimeoutError:
             await message.answer(
                 "Сервис сейчас перегружен. Подожди немного и попробуй снова.",
-                reply_markup=result_keyboard
+                reply_markup=initial_result_keyboard
             )
             return
 
@@ -1052,18 +1617,23 @@ async def finish_handler(message: Message, state: FSMContext):
                     "interest_score_after": initial_interest_score,
                 },
             )
+            mark_free_initial_used(user.id)
 
-        await message.answer(analysis, reply_markup=result_keyboard)
+        await message.answer(analysis, reply_markup=initial_result_keyboard)
+        await message.answer(
+            build_initial_action_card(analysis),
+            reply_markup=initial_result_keyboard,
+        )
     except asyncio.TimeoutError:
         await message.answer(
             "Сервис анализа сейчас отвечает слишком долго. Попробуй ещё раз через минуту.",
-            reply_markup=result_keyboard
+            reply_markup=initial_result_keyboard
         )
     except Exception as e:
         logger.exception("Analysis failed")
         await message.answer(
             f"Ошибка анализа: {type(e).__name__}: {e}",
-            reply_markup=result_keyboard
+            reply_markup=initial_result_keyboard
         )
 
     await state.clear()
@@ -1089,7 +1659,7 @@ async def collect_messages_handler(message: Message, state: FSMContext):
 
     if not raw_text:
         await message.answer(
-            "Это сообщение не удалось прочитать. Перешли текст, подпись или голосовое, "
+            "Это сообщение не удалось прочитать. Перешли текст, подпись, голосовое или кружок, "
             "либо нажми «Закончить и проанализировать».",
             reply_markup=collect_keyboard
         )
@@ -1135,12 +1705,12 @@ async def collect_messages_handler(message: Message, state: FSMContext):
 
     base_messages_count = data.get("base_messages_count", 0)
     current_count = len(messages) - base_messages_count
-    last_progress_count = data.get("last_progress_count", 0)
+    progress_hint_sent = data.get("progress_hint_sent", False)
 
     await state.update_data(messages=messages)
 
-    if current_count > 0 and current_count % 5 == 0 and current_count != last_progress_count:
-        await state.update_data(last_progress_count=current_count)
+    if current_count >= 10 and not progress_hint_sent:
+        await state.update_data(progress_hint_sent=True, last_progress_count=current_count)
         await message.answer(
             "Можешь переслать ещё или нажать «Закончить и проанализировать».",
             reply_markup=collect_keyboard
@@ -1153,19 +1723,20 @@ async def finish_followup_handler(message: Message, state: FSMContext):
     if current_state != AnalyzeState.collecting_followup.state:
         await message.answer(
             "Сейчас нечего сравнивать. Сначала нажми <b>Ответил — проверить что изменилось</b>.",
-            reply_markup=result_keyboard
+            reply_markup=followup_result_keyboard
         )
         return
 
     data = await state.get_data()
     followup_messages = sorted(data.get("followup_messages", []), key=lambda item: item["date"])
     source_run_id = data.get("followup_source_run_id")
+    followup_access_mode = data.get("followup_access_mode", "free")
     followup_limit_exceeded = data.get("followup_limit_exceeded", False)
 
     if followup_limit_exceeded:
         await message.answer(
             "Лимит новых сообщений для этого follow-up уже был превышен. Начни новый цикл меньшим куском.",
-            reply_markup=result_keyboard
+            reply_markup=followup_result_keyboard
         )
         await state.clear()
         return
@@ -1227,7 +1798,7 @@ async def finish_followup_handler(message: Message, state: FSMContext):
         except asyncio.TimeoutError:
             await message.answer(
                 "Сервис сейчас перегружен. Подожди немного и попробуй снова.",
-                reply_markup=result_keyboard
+                reply_markup=followup_result_keyboard
             )
             return
 
@@ -1288,6 +1859,19 @@ async def finish_followup_handler(message: Message, state: FSMContext):
             advice_effectiveness=advice_effectiveness,
         )
 
+        if followup_access_mode == "unlimited":
+            pass
+        elif followup_access_mode == "free":
+            mark_free_followup_used(user.id)
+        elif followup_access_mode == "paid":
+            if not consume_paid_credit(user.id, PAID_CREDIT_COST):
+                await message.answer(
+                    build_paywall_message("Повторная проверка после действия", get_user_access(user.id)),
+                    reply_markup=followup_result_keyboard,
+                )
+                await state.clear()
+                return
+
         save_analysis_run(
             user_id=user.id,
             run_type="followup",
@@ -1313,17 +1897,25 @@ async def finish_followup_handler(message: Message, state: FSMContext):
         if progress_summary:
             final_text = f"{progress_summary}\n\n━━━━━━━━━━━━━━\n\n{analysis}"
 
-        await message.answer(final_text, reply_markup=result_keyboard)
+        await message.answer(final_text, reply_markup=followup_result_keyboard)
+        await message.answer(
+            build_followup_outcome_card(
+                interest_before=interest_before,
+                interest_after=interest_after if interest_after is not None else current_interest,
+                advice_effectiveness=advice_effectiveness,
+            ),
+            reply_markup=followup_result_keyboard,
+        )
     except asyncio.TimeoutError:
         await message.answer(
             "Сервис анализа сейчас отвечает слишком долго. Попробуй ещё раз через минуту.",
-            reply_markup=result_keyboard
+            reply_markup=followup_result_keyboard
         )
     except Exception as exc:
         logger.exception("Follow-up analysis failed")
         await message.answer(
             f"Ошибка повторного анализа: {type(exc).__name__}: {exc}",
-            reply_markup=result_keyboard
+            reply_markup=followup_result_keyboard
         )
 
     await state.clear()
@@ -1347,7 +1939,7 @@ async def collect_followup_handler(message: Message, state: FSMContext):
 
     if not raw_text:
         await message.answer(
-            "Не удалось прочитать сообщение. Перешли текст, подпись или голосовое.",
+            "Не удалось прочитать сообщение. Перешли текст, подпись, голосовое или кружок.",
             reply_markup=followup_keyboard
         )
         return
@@ -1398,7 +1990,7 @@ async def collect_followup_handler(message: Message, state: FSMContext):
             await message.answer(
                 f"Ты превысил лимит — {MAX_DIALOG_MESSAGES} новых сообщений за один follow-up.\n"
                 "Этот цикл сравнения отменён. Начни новый follow-up меньшим куском.",
-                reply_markup=result_keyboard
+                reply_markup=followup_result_keyboard
             )
             await state.clear()
         return
@@ -1408,9 +2000,12 @@ async def collect_followup_handler(message: Message, state: FSMContext):
     await state.update_data(followup_messages=followup_messages)
 
     current_count = len(followup_messages)
-    last_progress_count = data.get("followup_last_progress_count", 0)
-    if current_count > 0 and current_count % 3 == 0 and current_count != last_progress_count:
-        await state.update_data(followup_last_progress_count=current_count)
+    followup_progress_hint_sent = data.get("followup_progress_hint_sent", False)
+    if current_count >= 6 and not followup_progress_hint_sent:
+        await state.update_data(
+            followup_progress_hint_sent=True,
+            followup_last_progress_count=current_count,
+        )
         await message.answer(
             "Можешь переслать ещё новые сообщения или нажать <b>Проверить что изменилось</b>.",
             reply_markup=followup_keyboard
@@ -1420,7 +2015,7 @@ async def collect_followup_handler(message: Message, state: FSMContext):
 @dp.message()
 async def fallback_handler(message: Message):
     await message.answer(
-        "Нажми <b>Старт</b>, затем перешли сообщения или голосовые из переписки.",
+        "Нажми <b>Старт</b>, затем перешли сообщения, голосовые или кружки из переписки.",
         reply_markup=start_keyboard
     )
 
