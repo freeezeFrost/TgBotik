@@ -37,6 +37,7 @@ from config import (
     MESSAGE_RATE_LIMIT_COUNT,
     MESSAGE_RATE_LIMIT_NOTICE_COOLDOWN,
     MESSAGE_RATE_LIMIT_WINDOW_SECONDS,
+    OWNER_USER_ID,
 )
 from ai_analyzer import analyze_chat, analyze_followup, generate_reply_variants, transcribe_voice
 from database import (
@@ -76,6 +77,14 @@ def configure_logging() -> None:
 
 
 logger = logging.getLogger(__name__)
+
+
+def bootstrap_owner_access() -> None:
+    if OWNER_USER_ID is None:
+        return
+
+    set_access_role(OWNER_USER_ID, "owner")
+    logger.info("Bootstrapped owner access for user_id=%s", OWNER_USER_ID)
 
 
 def is_collection_state(state_name: str | None) -> bool:
@@ -2023,6 +2032,7 @@ async def fallback_handler(message: Message):
 async def main():
     configure_logging()
     init_db()
+    bootstrap_owner_access()
     logger.info("Starting Telegram bot")
     bot = Bot(
         token=BOT_TOKEN,

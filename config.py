@@ -54,8 +54,20 @@ def get_non_negative_int_env(name: str, default: int) -> int:
     return value
 
 
+def get_optional_int_env(name: str) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} должен быть целым числом") from exc
+
+
 BOT_TOKEN = get_env("BOT_TOKEN", required=True)
 OPENAI_API_KEY = get_env("OPENAI_API_KEY", required=True)
+OWNER_USER_ID = get_optional_int_env("OWNER_USER_ID")
 OPENAI_MODEL = get_env("OPENAI_MODEL", default="gpt-4.1")
 OPENAI_TRANSCRIPTION_MODEL = get_env("OPENAI_TRANSCRIPTION_MODEL", default="gpt-4o-mini-transcribe")
 ANALYSIS_TIMEOUT_SECONDS = get_positive_int_env("ANALYSIS_TIMEOUT_SECONDS", default=45)
